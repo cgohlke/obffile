@@ -5,21 +5,20 @@ include pyproject.toml
 
 include obffile/py.typed
 
-include docs/conf.py
-include docs/index.rst
-include docs/_static/custom.css
-
-# include .github/workflows/wheel.yml
-
 exclude .env
+exclude .gitignore
 exclude *.cmd
 exclude *.yaml
+exclude *.code-workspace
 exclude mypy.ini
 exclude ruff.toml
+exclude typos.toml
+recursive-exclude .vscode *
 recursive-exclude doc *
 recursive-exclude docs *
 recursive-exclude test *
 recursive-exclude tests *
+recursive-exclude examples *
 
 recursive-exclude * __pycache__
 recursive-exclude * *.py[co]
