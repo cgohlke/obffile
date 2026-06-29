@@ -29,10 +29,11 @@
 
 """Unittests for the obffile package.
 
-:Version: 2026.2.20
+:Version: 2026.6.28
 
 """
 
+import contextlib
 import glob
 import io
 import itertools
@@ -116,12 +117,17 @@ class TestBinaryFile:
         assert fh.dirname == dirname
         assert fh.name == name
         assert fh.closed is False
+        assert fh.filesize == 256
         assert len(fh.filehandle.read()) == 256
         fh.filehandle.seek(10)
         assert fh.filehandle.tell() == 10
         assert fh.filehandle.read(1) == b'\n'
         fh.close()
-        assert fh.closed is closed
+        # underlying filehandle may still be be open if
+        # BinaryFile was given an open filehandle
+        assert fh._fh.closed is closed
+        # BinaryFile always reports itself as closed after close() is called
+        assert fh.closed
 
     def test_str(self):
         """Test BinaryFile with str path."""
@@ -191,8 +197,8 @@ class TestBinaryFile:
             def seek(self):
                 pass
 
-        with pytest.raises(TypeError):
-            BinaryFile(File)
+        with pytest.raises(ValueError):
+            BinaryFile(File())
 
     def test_openfile_not_seekable(self):
         """Test BinaryFile with non-seekable file fails."""
@@ -205,7 +211,7 @@ class TestBinaryFile:
                 return File()
 
         with pytest.raises(ValueError):
-            BinaryFile(File)
+            BinaryFile(File())
 
     def test_invalid_object(self):
         """Test BinaryFile with invalid file object fails."""
@@ -214,13 +220,191 @@ class TestBinaryFile:
             # mock non-file object
             pass
 
-        with pytest.raises(ValueError):
-            BinaryFile(File)
+        with pytest.raises(TypeError):
+            BinaryFile(File())
 
     def test_invalid_mode(self):
         """Test BinaryFile with invalid mode fails."""
         with pytest.raises(ValueError):
             BinaryFile(self.filename, mode='ab')
+
+    def test_memmap_disabled(self):
+        """Test memmap=False (default) does not memory-map file."""
+        with BinaryFile(self.filename) as fh:
+            assert fh._mm is None
+        with BinaryFile(self.filename, memmap=False) as fh:
+            assert fh._mm is None
+
+    def test_memmap_bytesio_ignored(self):
+        """Test memmap=True is silently ignored for BytesIO."""
+        with open(self.filename, 'rb') as f:
+            data = f.read()
+        with BinaryFile(io.BytesIO(data), memmap=True) as fh:
+            assert fh._mm is None
+            assert bytes(fh._read_at(0, 4)) == b'\x00\x01\x02\x03'
+
+    @pytest.mark.parametrize('memmap', [False, True])
+    def test_read_at(self, memmap):
+        """Test _read_at returns bytes or memoryview at offset."""
+        with BinaryFile(self.filename, memmap=memmap) as fh:
+            data = fh._read_at(0, 4)
+            assert isinstance(data, memoryview if memmap else bytes)
+            assert bytes(data) == b'\x00\x01\x02\x03'
+            data = fh._read_at(10, 3)
+            assert bytes(data) == b'\x0a\x0b\x0c'
+
+    @pytest.mark.parametrize('memmap', [False, True])
+    def test_read_array(self, memmap):
+        """Test _read_array returns array at offset; dtype, count=-1, copy."""
+        dtype = numpy.dtype('uint8')
+        with BinaryFile(self.filename, memmap=memmap) as fh:
+            arr = fh._read_array(0, 4, dtype)
+            assert arr.dtype == dtype
+            assert numpy.array_equal(arr, [0, 1, 2, 3])
+            arr = fh._read_array(10, 3, dtype)
+            assert numpy.array_equal(arr, [10, 11, 12])
+            if memmap:
+                assert not arr.flags.writeable
+                arr_copy = fh._read_array(0, 4, dtype, copy=True)
+                assert arr_copy.flags.writeable
+                arr_copy[0] = 99  # must not raise
+            else:
+                # multi-byte dtype: binary.bin bytes as uint16 LE pairs
+                arr16 = fh._read_array(0, 4, numpy.dtype('<u2'))
+                assert numpy.array_equal(
+                    arr16, [0x0100, 0x0302, 0x0504, 0x0706]
+                )
+            # count=-1 reads to end of file
+            arr_end = fh._read_array(252, -1, dtype)
+            assert numpy.array_equal(arr_end, [252, 253, 254, 255])
+
+    def test_read_array_writable_memmap(self, tmp_path):
+        """Test  writable=False makes mmap RO; writable=True keeps it RW."""
+        tmpfile = tmp_path / 'test.bin'
+        with open(self.filename, 'rb') as src:
+            tmpfile.write_bytes(src.read())
+        dtype = numpy.dtype('uint8')
+        with BinaryFile(tmpfile, mode='r+', memmap=True) as fh:
+            arr_ro = fh._read_array(0, 4, dtype)
+            assert not arr_ro.flags.writeable
+            arr_rw = fh._read_array(0, 4, dtype, writable=True)
+            assert arr_rw.flags.writeable
+
+    def test_read_array_truncate(self, caplog):
+        """Test truncate=False raises; True returns partial; None logs."""
+        import logging
+
+        with (
+            BinaryFile(io.BytesIO(bytes(range(5)))) as fh,
+            pytest.raises(ValueError, match='expected 10 items, got 5'),
+        ):
+            fh._read_array(0, 10, numpy.uint8, truncate=False)
+        with BinaryFile(io.BytesIO(bytes(range(5)))) as fh:
+            arr = fh._read_array(0, 10, numpy.uint8, truncate=True)
+            assert len(arr) == 5
+            assert numpy.array_equal(arr, [0, 1, 2, 3, 4])
+        logger = BinaryFile.__module__.split('.')[0]
+        with (
+            BinaryFile(io.BytesIO(bytes(range(5)))) as fh,
+            caplog.at_level(logging.ERROR, logger=logger),
+        ):
+            arr = fh._read_array(0, 10, numpy.uint8, truncate=None)
+        assert len(arr) == 5
+        assert 'expected 10 items, got 5' in caplog.text
+
+    def test_read_array_mmap_alignment(self, tmp_path):
+        """Test mmap path truncates partial element to full boundary."""
+        # 7 bytes; requesting 4 uint16 (8 bytes); 3 complete elements fit
+        tmpfile = tmp_path / 'align.bin'
+        tmpfile.write_bytes(b'\x01\x00\x02\x00\x03\x00\xff')
+        dtype = numpy.dtype('<u2')
+        with BinaryFile(tmpfile, memmap=True) as fh:
+            arr = fh._read_array(0, 4, dtype, truncate=True)
+            assert len(arr) == 3
+            assert numpy.array_equal(arr, [1, 2, 3])
+            # truncate=False must raise even on mmap path
+            with pytest.raises(ValueError, match='expected 4 items, got 3'):
+                fh._read_array(0, 4, dtype, truncate=False)
+
+    def test_read_array_invalid_offset(self):
+        """Test _read_array raises ValueError for negative offset."""
+        with BinaryFile(io.BytesIO(bytes(range(8)))) as fh:  # noqa: SIM117
+            with pytest.raises(ValueError, match='offset'):
+                fh._read_array(-1, 4, numpy.uint8)
+
+    def test_read_array_invalid_count(self):
+        """Test _read_array raises ValueError for count < -1."""
+        with BinaryFile(io.BytesIO(bytes(range(8)))) as fh:  # noqa: SIM117
+            with pytest.raises(ValueError, match='count'):
+                fh._read_array(0, -2, numpy.uint8)
+
+    def test_write_at(self):
+        """Test _write_at writes bytes to file at given offset."""
+        with open(self.filename, 'rb') as fh:
+            data = fh.read()
+        file = io.BytesIO(data)
+        with BinaryFile(file, mode='r+') as fh:
+            fh._write_at(5, b'\xaa\xbb\xcc')
+            assert bytes(fh._read_at(4, 5)) == b'\x04\xaa\xbb\xcc\x08'
+        # verify persistence after close
+        assert file.getvalue()[5:8] == b'\xaa\xbb\xcc'
+
+    def test_write_at_memmap(self, tmp_path):
+        """Test _write_at writes via mmap; mode='r+' creates writable mmap."""
+        tmpfile = tmp_path / 'test.bin'
+        tmpfile.write_bytes(pathlib.Path(self.filename).read_bytes())
+        with BinaryFile(tmpfile, mode='r+', memmap=True) as fh:
+            assert fh._mm is not None
+            assert fh.writable
+            assert bytes(fh._read_at(0, 4)) == b'\x00\x01\x02\x03'
+            fh._write_at(5, b'\xaa\xbb\xcc')
+        with BinaryFile(tmpfile) as fh:
+            assert bytes(fh._read_at(5, 3)) == b'\xaa\xbb\xcc'
+
+    def test_memmapped(self):
+        """Test memmapped property reflects memory-map state."""
+        with BinaryFile(self.filename) as fh:
+            assert not fh.memmapped
+        with BinaryFile(self.filename, memmap=True) as fh:
+            assert fh.memmapped
+
+    def test_writable(self, tmp_path):
+        """Test writable property reflects file open mode."""
+        tmpfile = tmp_path / 'test.bin'
+        tmpfile.write_bytes(b'\x00' * 4)
+        with BinaryFile(tmpfile) as fh:
+            assert not fh.writable
+        with BinaryFile(tmpfile, mode='r+') as fh:
+            assert fh.writable
+
+    def test_name_setter(self):
+        """Test name setter updates display name and attrs."""
+        with BinaryFile(self.filename) as fh:
+            fh.name = 'custom'
+            assert fh.name == 'custom'
+            assert fh.attrs['name'] == 'custom'
+
+    def test_set_lock(self):
+        """Test set_lock enables and disables RLock; no-op when mmap active."""
+        import threading
+
+        with BinaryFile(self.filename) as fh:
+            assert isinstance(fh._lock, contextlib.nullcontext)
+            fh.set_lock(True)
+            assert isinstance(fh._lock, type(threading.RLock()))
+            fh.set_lock(False)
+            assert isinstance(fh._lock, contextlib.nullcontext)
+        with BinaryFile(self.filename, memmap=True) as fh:
+            lock_before = fh._lock
+            fh.set_lock(True)
+            assert fh._lock is lock_before
+
+    def test_repr(self):
+        """Test __repr__ includes class name and file name."""
+        with BinaryFile(self.filename) as fh:
+            r = repr(fh)
+            assert r.startswith('<BinaryFile ')
+            assert 'binary.bin' in r
 
 
 class TestObfFile:
@@ -281,8 +465,8 @@ def test_not_obf():
     """Test open non-OBF file raises exceptions."""
     with pytest.raises(ObfFileError):
         imread(DATA / 'empty.bin')
-    with pytest.raises(ValueError):
-        imread(ValueError)
+    with pytest.raises(TypeError):
+        imread(TypeError)
 
 
 @pytest.mark.parametrize('asxarray', [False, True])
@@ -301,15 +485,16 @@ def test_imread(asxarray):
     assert data.sum(dtype=numpy.uint32) == 599991
 
 
+@pytest.mark.parametrize('memmap', [False, True])
 @pytest.mark.parametrize('filetype', [str, io.BytesIO])
-def test_obf(filetype):
+def test_obf(memmap, filetype):
     """Test OBF file."""
     filename = DATA / 'Test.obf'
     file = (
         filename if filetype is str else open(filename, 'rb')  # noqa: SIM115
     )
 
-    with ObfFile(file, mode='r+b', squeeze=True) as obf:
+    with ObfFile(file, mode='r+b', memmap=memmap, squeeze=True) as obf:
         repr(obf)
         str(obf)
         if filetype is str:
@@ -428,11 +613,12 @@ def test_obf(filetype):
             obf = ObfFile(file, mode='abc')
 
 
-def test_obf_uncompressed():
+@pytest.mark.parametrize('memmap', [False, True])
+def test_obf_uncompressed(memmap):
     """Test OBF file v6 uncompressed."""
     filename = DATA / 'openmicroscopy.org/test-v6-uncompressed.obf'
 
-    with ObfFile(filename, squeeze=True) as obf:
+    with ObfFile(filename, squeeze=True, memmap=memmap) as obf:
         repr(obf)
         str(obf)
         assert obf.filename == str(filename.name)
@@ -528,11 +714,12 @@ def test_obf_uncompressed():
         assert data.data.sum(dtype=numpy.uint32) == 6540899
 
 
-def test_obf_v7():
+@pytest.mark.parametrize('memmap', [False, True])
+def test_obf_v7(memmap):
     """Test OBF file v7."""
     filename = DATA / 'image.sc-65820/2x Confocal STED .obf'
 
-    with ObfFile(filename, mode='r+b', squeeze=True) as obf:
+    with ObfFile(filename, mode='r+b', squeeze=True, memmap=memmap) as obf:
         repr(obf)
         str(obf)
         assert obf.filename == str(filename.name)
@@ -623,11 +810,12 @@ def test_obf_v7():
         assert data.data.sum(dtype=numpy.uint32) == 38935022
 
 
-def test_obf_lifetime():
+@pytest.mark.parametrize('memmap', [False, True])
+def test_obf_lifetime(memmap):
     """Test OBF file with lifetime data."""
     filename = DATA / 'zenodo-17039369/IMG0005_Lifetime3.obf'
 
-    with ObfFile(filename, mode='r+b', squeeze=True) as obf:
+    with ObfFile(filename, mode='r+b', squeeze=True, memmap=memmap) as obf:
         repr(obf)
         str(obf)
         assert obf.filename == str(filename.name)
@@ -719,18 +907,20 @@ def test_obf_lifetime():
 
 
 @pytest.mark.skipif(
-    not hasattr(sys, '_is_gil_enabled'), reason='Python < 3.12'
+    not hasattr(sys, '_is_gil_enabled'), reason='Python < 3.13'
 )
 def test_gil_enabled():
-    """Test that GIL is disabled on thread-free Python."""
+    """Test that GIL state is consistent with build configuration."""
     assert sys._is_gil_enabled() != sysconfig.get_config_var('Py_GIL_DISABLED')
 
 
 @pytest.mark.parametrize(
     'fname',
-    itertools.chain.from_iterable(
-        glob.glob(f'**/*{ext}', root_dir=DATA, recursive=True)
-        for ext in FILE_EXTENSIONS
+    tuple(
+        itertools.chain.from_iterable(
+            glob.glob(f'**/*{ext}', root_dir=DATA, recursive=True)
+            for ext in FILE_EXTENSIONS
+        )
     ),
 )
 def test_glob(fname):
