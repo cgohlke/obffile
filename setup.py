@@ -7,8 +7,6 @@ import sys
 
 from setuptools import setup
 
-buildnumber = ''
-
 
 def search(pattern: str, string: str, flags: int = 0) -> str:
     """Return first match of pattern in string."""
@@ -41,12 +39,11 @@ with open('obffile/obffile.py', encoding='utf-8') as fh:
     code = fh.read()
 
 version = search(r"__version__ = '(.*?)'", code).replace('.x.x', '.dev0')
-version += ('.' + buildnumber) if buildnumber else ''
 
 description = search(r'"""(.*)\.(?:\r\n|\r|\n)', code)
 
 readme = search(
-    r'(?:\r\n|\r|\n){2}"""(.*)"""(?:\r\n|\r|\n){2}from __future__',
+    r'(?:\r\n|\r|\n){2}r"""(.*)"""(?:\r\n|\r|\n){2}from __future__',
     code,
     re.MULTILINE | re.DOTALL,
 )
@@ -102,21 +99,20 @@ setup(
     },
     packages=['obffile'],
     package_data={'obffile': ['py.typed']},
-    entry_points={'console_scripts': ['obffile = obffile.__main__:main']},
-    python_requires='>=3.11',
-    install_requires=['numpy'],
+    entry_points={'console_scripts': ['obffile = obffile.obffile:main']},
+    python_requires='>=3.12',
+    install_requires=['numpy>=2.1'],
     extras_require={'all': ['xarray', 'tifffile', 'matplotlib']},
-    zip_safe=False,
     platforms=['any'],
     classifiers=[
-        'Development Status :: 3 - Alpha',
+        'Development Status :: 4 - Beta',
         'Intended Audience :: Science/Research',
         'Intended Audience :: Developers',
         'Operating System :: OS Independent',
         'Programming Language :: Python :: 3 :: Only',
-        'Programming Language :: Python :: 3.11',
         'Programming Language :: Python :: 3.12',
         'Programming Language :: Python :: 3.13',
         'Programming Language :: Python :: 3.14',
+        'Programming Language :: Python :: 3.15',
     ],
 )
