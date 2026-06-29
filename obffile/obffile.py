@@ -29,7 +29,7 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-"""Read Imspector object binary format files (OBF and MSR).
+r"""Read Imspector object binary format files (OBF and MSR).
 
 Obffile is a Python library to read image and metadata from
 Object Binary Format (OBF) and Measurement Summary Record (MSR) image files.
@@ -38,7 +38,8 @@ from microscopy experiments.
 
 :Author: `Christoph Gohlke <https://www.cgohlke.com>`_
 :License: BSD-3-Clause
-:Version: 2026.2.20
+:Version: 2026.6.28
+:DOI: `10.5281/zenodo.18706395 <https://doi.org/10.5281/zenodo.18706395>`_
 
 Quickstart
 ----------
@@ -59,14 +60,20 @@ Requirements
 This revision was tested with the following requirements and dependencies
 (other versions may work):
 
-- `CPython <https://www.python.org>`_ 3.11.9, 3.12.10, 3.13.12, 3.14.3 64-bit
-- `NumPy <https://pypi.org/project/numpy>`_ 2.4.2
-- `Xarray <https://pypi.org/project/xarray>`_ 2026.2.0 (recommended)
-- `Matplotlib <https://pypi.org/project/matplotlib/>`_ 3.10.8 (optional)
-- `Tifffile <https://pypi.org/project/tifffile/>`_ 2026.2.16 (optional)
+- `CPython <https://www.python.org>`_ 3.12.10, 3.13.14, 3.14.5, 3.15.0b3 64-bit
+- `NumPy <https://pypi.org/project/numpy>`_ 2.5.0
+- `Xarray <https://pypi.org/project/xarray>`_ 2026.4.0 (recommended)
+- `Matplotlib <https://pypi.org/project/matplotlib/>`_ 3.11.0 (optional)
+- `Tifffile <https://pypi.org/project/tifffile/>`_ 2026.6.1 (optional)
 
 Revisions
 ---------
+
+2026.6.28
+
+- Add option to memory-map OBF files.
+- Support Python 3.15.
+- Drop support for Python 3.11 and numpy 2.0 (SPEC0).
 
 2026.2.20
 
@@ -76,21 +83,28 @@ Revisions
 Notes
 -----
 
+This library is in its early stages of development.
+Large, backwards-incompatible changes may occur between revisions.
+
 `Imspector <https://imspectordocs.readthedocs.io>`_ is a software platform for
 super-resolution and confocal microscopy developed by Abberior Instruments.
 
-This library is in its early stages of development. It is not feature-complete.
-Large, backwards-incompatible changes may occur between revisions.
+The Imspector image file formats (OBF and MSR) are documented at
+https://imspectordocs.readthedocs.io/en/latest/fileformat.html.
 
-Specifically, the following features are not supported:
+OBF is a little-endian binary format storing named, multidimensional image
+stacks with metadata. Each file has a magic header (``OMAS_BF\n\xff\xff``),
+a format version, an XML description, and a linked list of stack records.
+Stack data may be uncompressed or zlib-compressed. MSR files embed OBF and
+add Imspector-specific data such as window layout and hardware configuration.
+The format is designed for forward and backward compatibility.
+
+This library is not feature-complete. Unsupported features currently include
 writing or modifying OBF/MSR files, non-OBF based MSR files, reading
 MSR-specific non-image data (window positions, hardware configuration),
 and compression types other than zlib.
 
 The library has been tested with a limited number of files only.
-
-The Imspector image file formats are documented at
-https://imspectordocs.readthedocs.io/en/latest/fileformat.html.
 
 Other implementations for reading Imspector image files are
 `msr-reader <https://github.com/hoerlteam/msr-reader>`_,
@@ -100,7 +114,7 @@ Other implementations for reading Imspector image files are
 Examples
 --------
 
-Read an image stack and metadata from a OBF file:
+Read an image stack and metadata from an OBF file:
 
 >>> with ObfFile('tests/data/Test.obf') as obf:
 ...     assert obf.header.metadata['ome_xml'].startswith('<?xml')
@@ -121,7 +135,7 @@ Coordinates:
     * X        (X) float64 3kB 0.0 2.002e-07 4.003e-07 ...
 ...
 
-View the image stack and metadata in a OBF file from the console::
+View the image stack and metadata in an OBF file from the console::
 
     $ python -m obffile tests/data/Test.obf
 
@@ -129,7 +143,7 @@ View the image stack and metadata in a OBF file from the console::
 
 from __future__ import annotations
 
-__version__ = '2026.2.20'
+__version__ = '2026.6.28'
 
 __all__ = [
     'FILE_EXTENSIONS',
@@ -148,23 +162,26 @@ __all__ = [
 import contextlib
 import dataclasses
 import io
+import logging
 import math
+import mmap
 import os
 import re
 import struct
 import sys
+import threading
 import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import TYPE_CHECKING, ClassVar, final, overload
+from typing import TYPE_CHECKING, ClassVar, final, overload, override
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from types import TracebackType
     from typing import IO, Any, Literal, Self
 
-    from numpy.typing import NDArray
+    from numpy.typing import DTypeLike, NDArray
     from xarray import DataArray
 
 import numpy
@@ -176,6 +193,7 @@ def imread(
     /,
     stack: int = 0,
     *,
+    memmap: bool = False,
     squeeze: bool = True,
     asxarray: Literal[False] = ...,
 ) -> NDArray[Any]: ...
@@ -187,6 +205,7 @@ def imread(
     /,
     stack: int = 0,
     *,
+    memmap: bool = False,
     squeeze: bool = True,
     asxarray: Literal[True] = ...,
 ) -> DataArray: ...
@@ -197,6 +216,7 @@ def imread(
     /,
     stack: int = 0,
     *,
+    memmap: bool = False,
     squeeze: bool = True,
     asxarray: bool = False,
 ) -> NDArray[Any] | DataArray:
@@ -209,6 +229,10 @@ def imread(
             Name of Object Binary Format file or seekable binary stream.
         stack:
             Index of image stack to read.
+        memmap:
+            Map file into memory.
+            Ignored if memory mapping is not available or if the stream does
+            not support it.
         squeeze:
             Remove dimensions of length one from stacks.
         asxarray:
@@ -219,7 +243,7 @@ def imread(
             Image stack data as numpy array or xarray DataArray.
 
     """
-    with ObfFile(file, squeeze=squeeze) as obf:
+    with ObfFile(file, squeeze=squeeze, memmap=memmap) as obf:
         im = obf.stacks[stack]
         return im.asxarray() if asxarray else im.asarray()
 
@@ -235,22 +259,37 @@ class BinaryFile:
         file:
             File name or seekable binary stream.
         mode:
-            File open mode if `file` is a file name.
-            If not specified, defaults to 'r'. Files are always opened
+            File open mode if ``file`` is a file name.
+            If not specified, defaults to ``'r'``. Files are always opened
             in binary mode.
+        memmap:
+            Map file into memory.
+            Ignored if memory mapping is not available or if the stream does
+            not support it.
+
+    Notes:
+        Memory mapping can improve random-access read performance on large
+        files or repeated reads of the same file regions by reducing syscall
+        overhead and data copying.
+        For sequential one-pass reads, regular buffered I/O may be faster.
 
     Raises:
+        TypeError:
+            File is a text stream, or an unsupported type.
         ValueError:
             Invalid file name, extension, or stream.
-            File is not a binary or seekable stream.
+            File stream is not seekable.
 
     """
 
     _fh: IO[bytes]
+    _mm: mmap.mmap | None
+    _mv: memoryview | None  # view of _mm
     _path: str  # absolute path of file
     _name: str  # name of file or handle
     _close: bool  # file needs to be closed
     _closed: bool  # file is closed
+    _lock: contextlib.AbstractContextManager[Any]
     _ext: ClassVar[set[str]] = set()  # valid extensions, empty for any
 
     def __init__(
@@ -259,12 +298,16 @@ class BinaryFile:
         /,
         *,
         mode: Literal['r', 'r+'] | None = None,
+        memmap: bool = False,
     ) -> None:
 
+        self._mm = None
+        self._mv = None
         self._path = ''
         self._name = 'Unnamed'
         self._close = False
         self._closed = False
+        self._lock = contextlib.nullcontext()
 
         if isinstance(file, (str, os.PathLike)):
             ext = os.path.splitext(file)[-1].lower()
@@ -275,6 +318,7 @@ class BinaryFile:
                 mode = 'r'
             else:
                 if mode[-1:] == 'b':
+                    # accept 'rb'/'r+b'
                     mode = mode[:-1]  # type: ignore[assignment]
                 if mode not in {'r', 'r+'}:
                     msg = f'invalid {mode=!r}'
@@ -286,7 +330,9 @@ class BinaryFile:
         elif hasattr(file, 'seek'):
             # binary stream: open file, BytesIO, fsspec LocalFileOpener
             if isinstance(file, io.TextIOBase):  # type: ignore[unreachable]
-                msg = f'{file=!r} is not open in binary mode'
+                msg = (  # type: ignore[unreachable]
+                    f'{file=!r} is not open in binary mode'
+                )
                 raise TypeError(msg)
 
             self._fh = file
@@ -294,11 +340,11 @@ class BinaryFile:
                 self._fh.tell()
             except Exception as exc:
                 msg = f'{file=!r} is not seekable'
-                raise TypeError(msg) from exc
+                raise ValueError(msg) from exc
             if hasattr(file, 'path'):
-                self._path = os.path.normpath(file.path)
+                self._path = os.path.abspath(file.path)
             elif hasattr(file, 'name'):
-                self._path = os.path.normpath(file.name)
+                self._path = os.path.abspath(file.name)
 
         elif hasattr(file, 'open'):
             # fsspec OpenFile
@@ -312,20 +358,35 @@ class BinaryFile:
                 msg = f'{file=!r} is not seekable'
                 raise ValueError(msg) from exc
             if hasattr(file, 'path'):
-                self._path = os.path.normpath(file.path)
+                self._path = os.path.abspath(file.path)
 
         else:
             msg = f'cannot handle {type(file)=}'
-            raise ValueError(msg)
+            raise TypeError(msg)
 
         if hasattr(file, 'name') and file.name:
             self._name = os.path.basename(file.name)
         elif self._path:
             self._name = os.path.basename(self._path)
-        elif isinstance(file, io.BytesIO):
-            self._name = 'BytesIO'
-        # else:
-        #     self._name = f'{type(file)}'
+        else:
+            self._name = type(file).__name__
+
+        if memmap:
+            _fh: Any = self._fh
+            if isinstance(_fh, mmap.mmap):
+                self._mm = _fh
+                self._mv = memoryview(self._mm)
+            else:
+                try:
+                    access = (
+                        mmap.ACCESS_WRITE
+                        if self._fh.writable()
+                        else mmap.ACCESS_READ
+                    )
+                    self._mm = mmap.mmap(self._fh.fileno(), 0, access=access)
+                    self._mv = memoryview(self._mm)
+                except OSError:
+                    pass
 
     @property
     def filehandle(self) -> IO[bytes]:
@@ -334,17 +395,17 @@ class BinaryFile:
 
     @property
     def filepath(self) -> str:
-        """Path to file or empty if binary stream."""
+        """Absolute path to file, or empty string if no path is available."""
         return self._path
 
     @property
     def filename(self) -> str:
-        """Name of file or empty if binary stream."""
+        """Basename of file path, or empty string if no path is available."""
         return os.path.basename(self._path)
 
     @property
     def dirname(self) -> str:
-        """Directory containing file or empty if binary stream."""
+        """Directory containing file, or empty string if no path available."""
         return os.path.dirname(self._path)
 
     @property
@@ -362,14 +423,188 @@ class BinaryFile:
         return {'name': self.name, 'filepath': self.filepath}
 
     @property
+    def lock(self) -> contextlib.AbstractContextManager[Any]:
+        """Lock for thread-safe file access."""
+        return self._lock
+
+    def set_lock(self, enabled: bool, /) -> None:  # noqa: FBT001
+        """Enable or disable thread-safe file access.
+
+        Parameters:
+            enabled:
+                If true, use a threading.RLock, else a no-op lock.
+                Has no effect when memory-mapped I/O is active.
+
+        """
+        if self._mm is not None:
+            return
+        self._lock = threading.RLock() if enabled else contextlib.nullcontext()
+
+    def _write_at(
+        self, offset: int, data: bytes | bytearray | memoryview, /
+    ) -> None:
+        """Write bytes to file at given offset.
+
+        Parameters:
+            offset: Byte offset from start of file.
+            data: Data to write.
+
+        """
+        if self._mm is not None and self.writable:
+            # writable mmap: direct slice write, no cursor movement
+            self._mm[offset : offset + len(data)] = data
+        else:
+            with self._lock:
+                self._fh.seek(offset)
+                self._fh.write(data)
+
+    def _read_at(self, offset: int, size: int, /) -> bytes | memoryview:
+        """Read bytes from file at given offset.
+
+        For memory-mapped files, returned bytes are exposed as a
+        ``memoryview`` of the mapping. Keeping that view alive may keep
+        the memory map (and associated file resources/lock) alive.
+
+        Parameters:
+            offset: Byte offset from start of file.
+            size: Number of bytes to read.
+
+        """
+        mv = self._mv
+        if mv is not None:
+            return mv[offset : offset + size]
+        fh = self._fh
+        with self._lock:
+            fh.seek(offset)
+            return fh.read(size)
+
+    def _read_array(
+        self,
+        offset: int,
+        count: int,
+        dtype: DTypeLike,
+        *,
+        copy: bool = False,
+        writable: bool = False,
+        truncate: bool | None = False,
+    ) -> NDArray[Any]:
+        """Read numpy array from file at given offset.
+
+        For memory-mapped files, returned data are exposed directly as a
+        NumPy array view of the mapping (zero copy). Keeping that array alive
+        may keep the memory map (and associated file resources/lock) alive.
+
+        Parameters:
+            offset:
+                Byte offset from start of file.
+            count:
+                Number of elements to read. If ``-1``, read to end of file.
+            dtype:
+                Array element type.
+            copy:
+                If true, always return a detached copy in main memory.
+                For memory-mapped files, bypass the direct-view fast path.
+            writable:
+                By default, return read-only array from memory-mapped file.
+                Prevents accidental modification of underlying writable file.
+                Has no effect for non-memory-mapped files (always writeable).
+            truncate:
+                Allow partial reads of array.
+                If None, log error on partial read.
+
+        """
+        dtype = numpy.dtype(dtype)
+        itemsize = dtype.itemsize
+        if offset < 0:
+            msg = f'{offset=} < 0'
+            raise ValueError(msg)
+        if count < -1:
+            msg = f'{count=} < -1'
+            raise ValueError(msg)
+
+        mv = self._mv
+        if mv is not None:
+            if count == -1:
+                count = max(0, (len(mv) - offset) // itemsize)
+            nbytes = count * itemsize
+            size = min(nbytes, max(0, len(mv) - offset))
+            n = size - size % itemsize
+            array = numpy.frombuffer(
+                mv[offset : offset + n],
+                dtype,
+            )
+            if copy:
+                array = array.copy()
+            elif not writable and array.flags.writeable:
+                array.flags.writeable = False
+        elif count > -1:
+            fh = self._fh
+            nbytes = count * itemsize
+            array = numpy.empty(count, dtype)
+            with self._lock:
+                fh.seek(offset)
+                n = fh.readinto(array.data)  # type: ignore[attr-defined]
+        else:
+            fh = self._fh
+            with self._lock:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                count = max(0, (size - offset) // itemsize)
+                nbytes = count * itemsize
+                array = numpy.empty(count, dtype)
+                fh.seek(offset)
+                n = fh.readinto(array.data)  # type: ignore[attr-defined]
+
+        if n != nbytes:
+            array = array[: n // itemsize]
+            msg = f'expected {count} items, got {n // itemsize}'
+            if truncate is None:
+                logging.getLogger(__name__.split('.', 1)[0]).error(msg)
+            elif not truncate:
+                raise ValueError(msg)
+
+        return array
+
+    @cached_property
+    def filesize(self) -> int:
+        """Size of file in bytes."""
+        if self._mm is not None:
+            return len(self._mm)
+        fh = self._fh
+        try:
+            return os.fstat(fh.fileno()).st_size
+        except (AttributeError, io.UnsupportedOperation, OSError):
+            pass
+        with self._lock:
+            pos = fh.tell()
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(pos)
+        return size
+
+    @property
+    def writable(self) -> bool:
+        """File is open for writing."""
+        return self._fh.writable()
+
+    @property
+    def memmapped(self) -> bool:
+        """File is memory-mapped."""
+        return self._mm is not None
+
+    @property
     def closed(self) -> bool:
         """File is closed."""
         return self._closed
 
     def close(self) -> None:
         """Close file."""
+        self._closed = True  # always report file as closed
+        self._mv = None  # do not release(), threads may hold local refs
+        if self._mm is not None and self._mm is not self._fh:  # type: ignore[comparison-overlap]
+            with contextlib.suppress(Exception):
+                self._mm.close()
         if self._close:
-            self._closed = True
             with contextlib.suppress(Exception):
                 self._fh.close()
 
@@ -385,9 +620,7 @@ class BinaryFile:
         self.close()
 
     def __repr__(self) -> str:
-        if self._name:
-            return f'<{self.__class__.__name__} {self._name!r}>'
-        return f'<{self.__class__.__name__}>'
+        return f'<{self.__class__.__name__} {self._name!r}>'
 
 
 @final
@@ -403,8 +636,13 @@ class ObfFile(BinaryFile):
         file:
             Name of Object Binary Format file or seekable binary stream.
         mode:
-            File open mode if `file` is file name.
-            The default is 'r'. Files are always opened in binary mode.
+            File open mode if ``file`` is a file name.
+            If not specified, defaults to ``'r'``. Files are always opened
+            in binary mode.
+        memmap:
+            Map file into memory.
+            Ignored if memory mapping is not available or if the stream does
+            not support it.
         squeeze:
             Remove dimensions of length one from stacks.
 
@@ -423,10 +661,11 @@ class ObfFile(BinaryFile):
         file: str | os.PathLike[Any] | IO[bytes],
         /,
         *,
+        memmap: bool = False,
         squeeze: bool = True,
         mode: Literal['r', 'r+'] | None = None,
     ) -> None:
-        super().__init__(file, mode=mode)
+        super().__init__(file, mode=mode, memmap=memmap)
 
         self._squeeze = bool(squeeze)
         try:
@@ -443,6 +682,7 @@ class ObfFile(BinaryFile):
         """Sequence of image stacks in file."""
         return ObfStackSequence(self)
 
+    @override
     def __enter__(self) -> Self:
         return self
 
@@ -464,17 +704,12 @@ class ObfStack:
     footer: ObfStackFooter
     """Parsed stack footer."""
 
-    def __init__(
-        self,
-        fh: IO[bytes],
-        *,
-        squeeze: bool,
-    ) -> None:
-        self._fh = fh
-        self._squeeze = squeeze
+    _parent: ObfFile
 
-        self.header = ObfStackHeader.fromfile(fh)
-        self.footer = ObfStackFooter.fromfile(fh, self.header)
+    def __init__(self, parent: ObfFile, /) -> None:
+        self._parent = parent
+        self.header = ObfStackHeader.fromfile(self._parent._fh)
+        self.footer = ObfStackFooter.fromfile(self._parent._fh, self.header)
 
         # parse dtype and samples-per-pixel from header flags
         dtype_flags = self.header.data_type
@@ -520,7 +755,7 @@ class ObfStack:
         """Stack name."""
         return self.header.name
 
-    @cached_property
+    @property
     def dtype(self) -> numpy.dtype[Any]:
         """NumPy data type of image stack."""
         return self._dtype
@@ -547,7 +782,7 @@ class ObfStack:
         for orig_i, size, lbl in zip(
             orig_idx_rev, shape_rev, labels_rev, strict=True
         ):
-            if self._squeeze and size == 1:
+            if self._parent._squeeze and size == 1:
                 continue
             key = lbl.strip()
             if not key:
@@ -604,7 +839,7 @@ class ObfStack:
         orig_indices = [
             orig_i
             for orig_i, size in zip(orig_idx_rev, raw_shape[::-1], strict=True)
-            if not (self._squeeze and size == 1)
+            if not (self._parent._squeeze and size == 1)
         ]
         # TODO: use footer si_dimension and si_dimensions?
         result: dict[str, NDArray[Any]] = {}
@@ -638,7 +873,7 @@ class ObfStack:
             attrs['si_dimensions'] = tuple(
                 str(s)
                 for s, size in zip(si_dims, list(hdr.res)[::-1], strict=True)
-                if not (self._squeeze and size == 1)
+                if not (self._parent._squeeze and size == 1)
             )
         if self.footer.metadata:
             attrs['metadata'] = self.footer.metadata
@@ -650,13 +885,11 @@ class ObfStack:
         """Return image stack data as NumPy array."""
         hdr = self.header
         ftr = self.footer
-        fh = self._fh
 
         num_chunks = ftr.num_chunk_positions or 0
 
         if num_chunks == 0:
-            fh.seek(hdr.data_pos)
-            raw = fh.read(hdr.data_length)
+            raw = self._parent._read_at(hdr.data_pos, hdr.data_length)
         else:
             # chunked / interleaved read (format version 6)
             #
@@ -678,21 +911,21 @@ class ObfStack:
 
             pos = 0
             idx = 0
-            seek_pos = hdr.data_pos
-            fh.seek(seek_pos)
-            pieces: list[bytes] = []
+            read_pos = hdr.data_pos
+            pieces = []
             while pos < bytes_written:
                 n = bytes_written - pos
+                next_read_pos = read_pos + n
                 if idx < len(ftr.chunk_positions):
                     lo, fo = ftr.chunk_positions[idx]
                     if pos + n > lo:
                         n = lo - pos
-                        seek_pos = fo + hdr.data_pos
+                        next_read_pos = fo + hdr.data_pos
                         idx += 1
                 if n > 0:
-                    pieces.append(fh.read(n))
-                fh.seek(seek_pos)
+                    pieces.append(self._parent._read_at(read_pos, n))
                 pos += n
+                read_pos = next_read_pos
             raw = b''.join(pieces)
 
         if hdr.compression_type == 1:
@@ -704,7 +937,7 @@ class ObfStack:
         if len(raw) % itemsize:
             raw = raw[: len(raw) // itemsize * itemsize]
 
-        arr = numpy.frombuffer(raw, dtype=self._dtype)
+        arr = numpy.frombuffer(bytes(raw), dtype=self._dtype)
 
         # trim oversized array (shouldn't normally occur)
         total_expected = self.size
@@ -762,7 +995,7 @@ class ObfStackSequence(Sequence[ObfStack]):
         next_pos = parent.header.first_stack_pos
         while next_pos != 0:
             parent._fh.seek(next_pos)
-            stack = ObfStack(parent._fh, squeeze=parent._squeeze)
+            stack = ObfStack(parent)
             self._stacks[stack.name] = stack
             next_pos = stack.header.next_stack_pos
 
@@ -816,6 +1049,7 @@ class ObfStackSequence(Sequence[ObfStack]):
                 images.append(stack)
         return tuple(images)
 
+    @override
     def __getitem__(  # type: ignore[override]
         self,
         key: int | str,
@@ -845,9 +1079,11 @@ class ObfStackSequence(Sequence[ObfStack]):
         msg = f'stack {key!r} not found'
         raise KeyError(msg)
 
+    @override
     def __len__(self) -> int:
         return len(self._stacks)
 
+    @override
     def __iter__(self) -> Iterator[ObfStack]:
         return iter(self._stacks.values())
 
@@ -1244,6 +1480,11 @@ FILE_EXTENSIONS = {
     '.msr': 'MSR files',
 }
 """Supported file extensions of Imspector image files."""
+
+
+def logger() -> logging.Logger:
+    """Return module logger."""
+    return logging.getLogger('obffile')
 
 
 def read_strn(fh: IO[bytes], length: int | None = None) -> str:
