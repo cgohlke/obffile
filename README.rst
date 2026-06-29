@@ -11,7 +11,8 @@ from microscopy experiments.
 
 :Author: `Christoph Gohlke <https://www.cgohlke.com>`_
 :License: BSD-3-Clause
-:Version: 2026.2.20
+:Version: 2026.6.28
+:DOI: `10.5281/zenodo.18706395 <https://doi.org/10.5281/zenodo.18706395>`_
 
 Quickstart
 ----------
@@ -32,14 +33,20 @@ Requirements
 This revision was tested with the following requirements and dependencies
 (other versions may work):
 
-- `CPython <https://www.python.org>`_ 3.11.9, 3.12.10, 3.13.12, 3.14.3 64-bit
-- `NumPy <https://pypi.org/project/numpy>`_ 2.4.2
-- `Xarray <https://pypi.org/project/xarray>`_ 2026.2.0 (recommended)
-- `Matplotlib <https://pypi.org/project/matplotlib/>`_ 3.10.8 (optional)
-- `Tifffile <https://pypi.org/project/tifffile/>`_ 2026.2.16 (optional)
+- `CPython <https://www.python.org>`_ 3.12.10, 3.13.14, 3.14.5, 3.15.0b3 64-bit
+- `NumPy <https://pypi.org/project/numpy>`_ 2.5.0
+- `Xarray <https://pypi.org/project/xarray>`_ 2026.4.0 (recommended)
+- `Matplotlib <https://pypi.org/project/matplotlib/>`_ 3.11.0 (optional)
+- `Tifffile <https://pypi.org/project/tifffile/>`_ 2026.6.1 (optional)
 
 Revisions
 ---------
+
+2026.6.28
+
+- Add option to memory-map OBF files.
+- Support Python 3.15.
+- Drop support for Python 3.11 and numpy 2.0 (SPEC0).
 
 2026.2.20
 
@@ -49,21 +56,28 @@ Revisions
 Notes
 -----
 
+This library is in its early stages of development.
+Large, backwards-incompatible changes may occur between revisions.
+
 `Imspector <https://imspectordocs.readthedocs.io>`_ is a software platform for
 super-resolution and confocal microscopy developed by Abberior Instruments.
 
-This library is in its early stages of development. It is not feature-complete.
-Large, backwards-incompatible changes may occur between revisions.
+The Imspector image file formats (OBF and MSR) are documented at
+https://imspectordocs.readthedocs.io/en/latest/fileformat.html.
 
-Specifically, the following features are not supported:
+OBF is a little-endian binary format storing named, multidimensional image
+stacks with metadata. Each file has a magic header (``OMAS_BF\n\xff\xff``),
+a format version, an XML description, and a linked list of stack records.
+Stack data may be uncompressed or zlib-compressed. MSR files embed OBF and
+add Imspector-specific data such as window layout and hardware configuration.
+The format is designed for forward and backward compatibility.
+
+This library is not feature-complete. Unsupported features currently include
 writing or modifying OBF/MSR files, non-OBF based MSR files, reading
 MSR-specific non-image data (window positions, hardware configuration),
 and compression types other than zlib.
 
 The library has been tested with a limited number of files only.
-
-The Imspector image file formats are documented at
-https://imspectordocs.readthedocs.io/en/latest/fileformat.html.
 
 Other implementations for reading Imspector image files are
 `msr-reader <https://github.com/hoerlteam/msr-reader>`_,
@@ -73,7 +87,7 @@ Other implementations for reading Imspector image files are
 Examples
 --------
 
-Read an image stack and metadata from a OBF file:
+Read an image stack and metadata from an OBF file:
 
 .. code-block:: python
 
@@ -96,6 +110,6 @@ Read an image stack and metadata from a OBF file:
         * X        (X) float64 3kB 0.0 2.002e-07 4.003e-07 ...
     ...
 
-View the image stack and metadata in a OBF file from the console::
+View the image stack and metadata in an OBF file from the console::
 
     $ python -m obffile tests/data/Test.obf
