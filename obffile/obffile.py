@@ -38,7 +38,7 @@ from microscopy experiments.
 
 :Author: `Christoph Gohlke <https://www.cgohlke.com>`_
 :License: BSD-3-Clause
-:Version: 2026.6.28
+:Version: 2026.10.18
 :DOI: `10.5281/zenodo.18706395 <https://doi.org/10.5281/zenodo.18706395>`_
 
 Quickstart
@@ -49,7 +49,8 @@ Install the obffile package and all dependencies from the
 
     python -m pip install -U obffile[all]
 
-See `Examples`_ for using the programming interface.
+See `Examples`_ and `Documentation <https://www.cgohlke.com/docs/obffile/>`_
+for using the programming interface.
 
 Source code and support are available on
 `GitHub <https://github.com/cgohlke/obffile>`_.
@@ -60,14 +61,23 @@ Requirements
 This revision was tested with the following requirements and dependencies
 (other versions may work):
 
-- `CPython <https://www.python.org>`_ 3.12.10, 3.13.14, 3.14.5, 3.15.0b3 64-bit
-- `NumPy <https://pypi.org/project/numpy>`_ 2.5.0
-- `Xarray <https://pypi.org/project/xarray>`_ 2026.4.0 (recommended)
-- `Matplotlib <https://pypi.org/project/matplotlib/>`_ 3.11.0 (optional)
-- `Tifffile <https://pypi.org/project/tifffile/>`_ 2026.6.1 (optional)
+- `CPython <https://www.python.org>`_ 3.12.10, 3.13.16, 3.14.8, 3.15.0 64-bit
+- `Numpy <https://pypi.org/project/numpy>`_ 2.5.4
+- `Xarray <https://pypi.org/project/xarray>`_ 2026.9.0 (recommended)
+- `Matplotlib <https://pypi.org/project/matplotlib/>`_ 3.11.2 (optional)
+- `Tifffile <https://pypi.org/project/tifffile/>`_ 2026.10.15 (optional)
 
 Revisions
 ---------
+
+2026.10.18
+
+- Return writable stack arrays (memory-mapped views only in 'r+' mode).
+- Return zero-copy view of uncompressed, unchunked memory-mapped stacks.
+- Read and decompress stack data directly into output array.
+- Read flush and chunk position tables in one block.
+- Raise ObfFileError on unsupported compression types.
+- Raise ObfFileError on cyclic stack links.
 
 2026.6.28
 
@@ -114,6 +124,10 @@ Other implementations for reading Imspector image files are
 Examples
 --------
 
+Import functions and classes used in these examples:
+
+>>> from obffile import ObfFile
+
 Read an image stack and metadata from an OBF file:
 
 >>> with ObfFile('tests/data/Test.obf') as obf:
@@ -143,7 +157,7 @@ View the image stack and metadata in an OBF file from the console::
 
 from __future__ import annotations
 
-__version__ = '2026.6.28'
+__version__ = '2026.10.18'
 
 __all__ = [
     'FILE_EXTENSIONS',
@@ -289,6 +303,7 @@ class BinaryFile:
     _name: str  # name of file or handle
     _close: bool  # file needs to be closed
     _closed: bool  # file is closed
+    _memmap: bool  # open companion files using memmap
     _lock: contextlib.AbstractContextManager[Any]
     _ext: ClassVar[set[str]] = set()  # valid extensions, empty for any
 
@@ -307,6 +322,7 @@ class BinaryFile:
         self._name = 'Unnamed'
         self._close = False
         self._closed = False
+        self._memmap = bool(memmap)
         self._lock = contextlib.nullcontext()
 
         if isinstance(file, (str, os.PathLike)):
@@ -478,6 +494,34 @@ class BinaryFile:
             fh.seek(offset)
             return fh.read(size)
 
+    def _read_into(self, offset: int, buffer: NDArray[numpy.uint8], /) -> int:
+        """Read bytes from file at given offset into existing buffer.
+
+        Parameters:
+            offset: Byte offset from start of file.
+            buffer: Flat, writable uint8 numpy array to read into.
+
+        Returns:
+            Number of bytes read.
+
+        """
+        nbytes = len(buffer)
+        mv = self._mv
+        if mv is not None:
+            n = min(nbytes, max(0, len(mv) - offset))
+            buffer[:n] = numpy.frombuffer(mv[offset : offset + n], numpy.uint8)
+            return n
+
+        fh = self._fh
+        with self._lock:
+            fh.seek(offset)
+            try:
+                return fh.readinto(buffer)  # type: ignore[attr-defined, no-any-return]
+            except (AttributeError, OSError):
+                data = fh.read(nbytes)
+                buffer[: len(data)] = numpy.frombuffer(data, numpy.uint8)
+                return len(data)
+
     def _read_array(
         self,
         offset: int,
@@ -507,7 +551,7 @@ class BinaryFile:
             writable:
                 By default, return read-only array from memory-mapped file.
                 Prevents accidental modification of underlying writable file.
-                Has no effect for non-memory-mapped files (always writeable).
+                Has no effect for non-memory-mapped files (always writable).
             truncate:
                 Allow partial reads of array.
                 If None, log error on partial read.
@@ -888,8 +932,28 @@ class ObfStack:
 
         num_chunks = ftr.num_chunk_positions or 0
 
+        if hdr.compression_type not in {0, 1}:
+            raise ObfFileError(
+                f'unsupported compression type {hdr.compression_type}'
+            )
+
+        parent = self._parent
+        itemsize = self._dtype.itemsize
+        nbytes = self.size * itemsize
+
+        fragments: list[tuple[int, int]]
         if num_chunks == 0:
-            raw = self._parent._read_at(hdr.data_pos, hdr.data_length)
+            fragments = [(hdr.data_pos, hdr.data_length)]
+            mv = parent._mv
+            if hdr.compression_type == 0 and mv is not None:
+                n = min(hdr.data_length, max(0, len(mv) - hdr.data_pos))
+                if n >= nbytes:
+                    # zero-copy view of memory-mapped file.
+                    # writable if file was opened with 'r+'
+                    return numpy.frombuffer(
+                        mv[hdr.data_pos : hdr.data_pos + nbytes],
+                        dtype=self._dtype,
+                    ).reshape(self.shape)
         else:
             # chunked / interleaved read (format version 6)
             #
@@ -912,7 +976,7 @@ class ObfStack:
             pos = 0
             idx = 0
             read_pos = hdr.data_pos
-            pieces = []
+            fragments = []
             while pos < bytes_written:
                 n = bytes_written - pos
                 next_read_pos = read_pos + n
@@ -923,37 +987,42 @@ class ObfStack:
                         next_read_pos = fo + hdr.data_pos
                         idx += 1
                 if n > 0:
-                    pieces.append(self._parent._read_at(read_pos, n))
+                    fragments.append((read_pos, n))
                 pos += n
                 read_pos = next_read_pos
-            raw = b''.join(pieces)
 
-        if hdr.compression_type == 1:
-            raw = zlib.decompressobj().decompress(raw)
+        # read or decompress fragments directly into final buffer
+        buffer = numpy.empty(nbytes, dtype=numpy.uint8)
+        pos = 0
+        if hdr.compression_type == 0:
+            for offset, size in fragments:
+                size = min(size, nbytes - pos)  # noqa: PLW2901
+                if size <= 0:
+                    break
+                n = parent._read_into(offset, buffer[pos : pos + size])
+                pos += n
+                if n < size:
+                    break
+        else:
+            decomp = zlib.decompressobj()
+            for offset, size in fragments:
+                data: bytes | memoryview = parent._read_at(offset, size)
+                while data and pos < nbytes and not decomp.eof:
+                    # bound size of temporary decompressed blocks
+                    out = decomp.decompress(data, min(nbytes - pos, 16777216))
+                    buffer[pos : pos + len(out)] = numpy.frombuffer(
+                        out, dtype=numpy.uint8
+                    )
+                    pos += len(out)
+                    data = decomp.unconsumed_tail
+                if pos >= nbytes or decomp.eof:
+                    break
 
-        # trim trailing partial element (e.g. uncompressed chunked stacks
-        # where bytes_written is not a multiple of the element size)
-        itemsize = self._dtype.itemsize
-        if len(raw) % itemsize:
-            raw = raw[: len(raw) // itemsize * itemsize]
+        # zero trailing partial element and missing (partially written) data
+        pos -= pos % itemsize
+        buffer[pos:] = 0
 
-        arr = numpy.frombuffer(bytes(raw), dtype=self._dtype)
-
-        # trim oversized array (shouldn't normally occur)
-        total_expected = self.size
-        if arr.size > total_expected:
-            arr = arr[:total_expected]
-
-        # pad undersized (partially written) array with zeros
-        if arr.size < total_expected:
-            arr = numpy.concatenate(
-                [
-                    arr,
-                    numpy.zeros(total_expected - arr.size, dtype=self._dtype),
-                ]
-            )
-
-        return arr.reshape(self.shape)
+        return buffer.view(self._dtype).reshape(self.shape)
 
     def asxarray(self) -> DataArray:
         """Return image stack as xarray DataArray."""
@@ -992,8 +1061,12 @@ class ObfStackSequence(Sequence[ObfStack]):
         self._parent = parent
         self._stacks = {}
 
+        visited: set[int] = set()
         next_pos = parent.header.first_stack_pos
         while next_pos != 0:
+            if next_pos in visited:
+                raise ObfFileError(f'cyclic stack link at {next_pos}')
+            visited.add(next_pos)
             parent._fh.seek(next_pos)
             stack = ObfStack(parent)
             self._stacks[stack.name] = stack
@@ -1390,9 +1463,14 @@ class ObfStackFooter:
                 self.metadata = read_strn(fh, self.metadata_length)
 
             # 5. flush positions
-            for _ in range(self.num_flush_points):
-                fp = struct.unpack('<Q', fh.read(8))[0]
-                self.flush_positions.append(fp)
+            if self.num_flush_points:
+                size = int(self.num_flush_points) * 8
+                data = fh.read(size)
+                if len(data) != size:
+                    raise ObfFileError('truncated flush positions')
+                self.flush_positions = [
+                    v for (v,) in struct.iter_unpack('<Q', data)
+                ]
 
             # 6. tag dictionary
             if self.tag_dictionary_length:
@@ -1401,9 +1479,12 @@ class ObfStackFooter:
 
             # 7. chunk positions: (logical_offset, file_offset) pairs
             num_chunks = self.num_chunk_positions or 0
-            for _ in range(num_chunks):
-                lo, fo = struct.unpack('<2Q', fh.read(16))
-                self.chunk_positions.append((lo, fo))
+            if num_chunks:
+                size = int(num_chunks) * 16
+                data = fh.read(size)
+                if len(data) != size:
+                    raise ObfFileError('truncated chunk positions')
+                self.chunk_positions = list(struct.iter_unpack('<2Q', data))
 
         return self
 
