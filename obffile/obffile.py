@@ -38,7 +38,7 @@ from microscopy experiments.
 
 :Author: `Christoph Gohlke <https://www.cgohlke.com>`_
 :License: BSD-3-Clause
-:Version: 2026.10.18
+:Version: 2026.10.19
 :DOI: `10.5281/zenodo.18706395 <https://doi.org/10.5281/zenodo.18706395>`_
 
 Quickstart
@@ -70,7 +70,7 @@ This revision was tested with the following requirements and dependencies
 Revisions
 ---------
 
-2026.10.18
+2026.10.19
 
 - Return writable stack arrays (memory-mapped views only in 'r+' mode).
 - Return zero-copy view of uncompressed, unchunked memory-mapped stacks.
@@ -78,6 +78,7 @@ Revisions
 - Read flush and chunk position tables in one block.
 - Raise ObfFileError on unsupported compression types.
 - Raise ObfFileError on cyclic stack links.
+- Fix LICENSE file.
 
 2026.6.28
 
@@ -157,7 +158,7 @@ View the image stack and metadata in an OBF file from the console::
 
 from __future__ import annotations
 
-__version__ = '2026.10.18'
+__version__ = '2026.10.19'
 
 __all__ = [
     'FILE_EXTENSIONS',
