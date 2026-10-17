@@ -58,7 +58,7 @@ if 'sdist' in sys.argv:
         fh.write(fix_docstring_examples(readme))
 
     license = search(
-        r'(# Copyright.*?(?:\r\n|\r|\n))(?:\r\n|\r|\n)+""',
+        r'(# Copyright.*?(?:\r\n|\r|\n))(?:\r\n|\r|\n)+r"""',
         code,
         re.MULTILINE | re.DOTALL,
     )
