@@ -29,7 +29,7 @@
 
 """Unittests for the obffile package.
 
-:Version: 2026.10.18
+:Version: 2026.10.19
 
 """
 
