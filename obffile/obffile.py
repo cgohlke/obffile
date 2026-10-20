@@ -1056,11 +1056,11 @@ class ObfStackSequence(Sequence[ObfStack]):
     __slots__ = ('_parent', '_stacks')
 
     _parent: ObfFile
-    _stacks: dict[str, ObfStack]
+    _stacks: list[ObfStack]
 
     def __init__(self, parent: ObfFile, /) -> None:
         self._parent = parent
-        self._stacks = {}
+        self._stacks = []
 
         visited: set[int] = set()
         next_pos = parent.header.first_stack_pos
@@ -1069,8 +1069,9 @@ class ObfStackSequence(Sequence[ObfStack]):
                 raise ObfFileError(f'cyclic stack link at {next_pos}')
             visited.add(next_pos)
             parent._fh.seek(next_pos)
+            # stack names are not unique; for example, they may be empty
             stack = ObfStack(parent)
-            self._stacks[stack.name] = stack
+            self._stacks.append(stack)
             next_pos = stack.header.next_stack_pos
 
     def find(
@@ -1093,7 +1094,7 @@ class ObfStackSequence(Sequence[ObfStack]):
 
         """
         pattern = re.compile(key, flags=flags)
-        for stack in self._stacks.values():
+        for stack in self._stacks:
             value = stack.name
             if pattern.search(value) is not None:
                 return stack
@@ -1117,7 +1118,7 @@ class ObfStackSequence(Sequence[ObfStack]):
         """
         pattern = re.compile(key, flags=flags)
         images = []
-        for stack in self._stacks.values():
+        for stack in self._stacks:
             value = stack.name
             if pattern.search(value) is not None:
                 images.append(stack)
@@ -1139,15 +1140,15 @@ class ObfStackSequence(Sequence[ObfStack]):
         if isinstance(key, int):
             index = key
             try:
-                key = tuple(self._stacks.keys())[index]
+                return self._stacks[index]
             except IndexError:
                 msg = f'stack {index=} out of range'
                 raise IndexError(msg) from None
-            return self._stacks[key]
-        if key in self._stacks:
-            return self._stacks[key]
+        for stack in self._stacks:
+            if stack.name == key:
+                return stack
         pattern = re.compile(key, flags=re.IGNORECASE)
-        for stack in self._stacks.values():
+        for stack in self._stacks:
             if pattern.search(stack.name) is not None:
                 return stack
         msg = f'stack {key!r} not found'
@@ -1159,13 +1160,13 @@ class ObfStackSequence(Sequence[ObfStack]):
 
     @override
     def __iter__(self) -> Iterator[ObfStack]:
-        return iter(self._stacks.values())
+        return iter(self._stacks)
 
     def __repr__(self) -> str:
         return f'<{self.__class__.__name__} len={len(self._stacks)}>'
 
     def __str__(self) -> str:
-        return indent(repr(self)[1:-1], *(self._stacks.values()))
+        return indent(repr(self)[1:-1], *self._stacks)
 
 
 @dataclass(slots=True, frozen=True)

@@ -979,6 +979,31 @@ def test_obf_lifetime(memmap):
         )
 
 
+def test_msr_unnamed_stacks():
+    """Test MSR file with several stacks sharing an empty name."""
+    filename = DATA / 'msr-reader/groupa_cell01.msr'
+
+    with ObfFile(filename) as obf:
+        stacks = obf.stacks
+        assert len(stacks) == 7
+        assert [stack.name for stack in stacks] == [''] * 7
+        assert [stack.shape for stack in stacks] == [
+            (490, 450),
+            (490, 450),
+            (490, 450),
+            (490, 450),
+            (18,),
+            (18,),
+            (665,),
+        ]
+        assert stacks[-1] is stacks[6]
+        assert stacks[''] is stacks[0]
+        assert stacks.find('') is stacks[0]
+        assert len(stacks.findall('')) == 7
+        data = stacks[2].asarray()
+        assert data.sum(dtype=numpy.int64) == 87279577
+
+
 @pytest.mark.skipif(
     not hasattr(sys, '_is_gil_enabled'), reason='Python < 3.13'
 )
