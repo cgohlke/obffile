@@ -1,5 +1,9 @@
 # obffile/setup.py
 
+# Copyright (c) Christoph Gohlke
+# SPDX-License-Identifier: BSD-3-Clause
+# See LICENSE file in the project root for details.
+
 """Obffile package Setuptools script."""
 
 import re
@@ -32,7 +36,7 @@ def fix_docstring_examples(docstring: str) -> str:
                 lines.extend(['.. code-block:: python', ''])
                 start = False
         lines.append(('    ' if indent else '') + line)
-    return '\n'.join(lines)
+    return '\n'.join(lines) + '\n'
 
 
 with open('obffile/obffile.py', encoding='utf-8') as fh:
@@ -54,7 +58,7 @@ readme = '\n'.join(
 if 'sdist' in sys.argv:
     # update README and LICENSE files
 
-    with open('README.rst', 'w', encoding='utf-8') as fh:
+    with open('README.rst', 'w', encoding='utf-8', newline='\n') as fh:
         fh.write(fix_docstring_examples(readme))
 
     license = search(
@@ -64,7 +68,7 @@ if 'sdist' in sys.argv:
     )
     license = license.replace('# ', '').replace('#', '')
 
-    with open('LICENSE', 'w', encoding='utf-8') as fh:
+    with open('LICENSE', 'w', encoding='utf-8', newline='\n') as fh:
         fh.write('BSD-3-Clause license\n\n')
         fh.write(license)
 
