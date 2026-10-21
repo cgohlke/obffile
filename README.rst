@@ -11,7 +11,7 @@ from microscopy experiments.
 
 :Author: `Christoph Gohlke <https://www.cgohlke.com>`_
 :License: BSD-3-Clause
-:Version: 2026.10.19
+:Version: 2026.10.20
 :DOI: `10.5281/zenodo.18706395 <https://doi.org/10.5281/zenodo.18706395>`_
 
 Quickstart
@@ -42,6 +42,10 @@ This revision was tested with the following requirements and dependencies
 
 Revisions
 ---------
+
+2026.10.20
+
+- Preserve stacks with duplicate names (#1).
 
 2026.10.19
 
