@@ -29,7 +29,7 @@
 
 """Unittests for the obffile package.
 
-:Version: 2026.10.19
+:Version: 2026.10.20
 
 """
 
@@ -977,6 +977,137 @@ def test_obf_lifetime(memmap):
             13602.964329123497 + 15436.518050804734j,
             rtol=1e-5,
         )
+
+
+@pytest.mark.parametrize('memmap', [False, True])
+@pytest.mark.parametrize('squeeze', [False, True])
+def test_msr_v5(memmap, squeeze):
+    """Test legacy MSR header, metadata, and repeated dimension labels."""
+    filename = DATA / 'msr-reader/conf01.msr'
+
+    with ObfFile(filename, memmap=memmap, squeeze=squeeze) as obf:
+        assert obf.header.format_version == 1
+        assert obf.header.meta_data_position is None
+        assert obf.header.metadata == {}
+        assert len(obf.stacks) == 1
+
+        stack = obf.stacks[0]
+        assert stack.name == ''
+        assert stack.header.format_version == 5
+        assert stack.dtype == numpy.dtype('int16')
+        assert stack.shape == ((1024,) if squeeze else (1, 1, 1, 1024))
+        assert stack.dims == (
+            ('ExpControl T',)
+            if squeeze
+            else ('None', 'None2', 'None3', 'ExpControl T')
+        )
+
+        footer = stack.footer
+        assert footer.size == 1444
+        assert footer.samples_written is None
+        assert footer.num_chunk_positions is None
+        assert footer.metadata_length == 648
+        assert len(footer.metadata.encode('utf-8')) == 648
+        assert footer.metadata.startswith('<root ')
+        assert list(footer.tag_dictionary) == ['imspector']
+
+        data = stack.asxarray()
+        assert data.shape == stack.shape
+        assert data.dims == stack.dims
+        assert data.attrs['metadata'] == footer.metadata
+        assert data.data.sum(dtype=numpy.int64) == 103794
+
+
+@pytest.mark.parametrize('memmap', [False, True])
+def test_msr_extended_footer(memmap):
+    """Test variable metadata is read after extended version 7 footer."""
+    filename = DATA / 'msr-reader/bad44489_field_0_sted_0.msr'
+
+    with ObfFile(filename, memmap=memmap) as obf:
+        assert obf.header.format_version == 2
+        assert len(obf.stacks) == 2
+        assert [stack.name for stack in obf.stacks] == [
+            'ATTO 594_STED {0}',
+            'STAR 635P_STED {0}',
+        ]
+        for stack, total in zip(obf.stacks, (33612, 31714), strict=True):
+            assert stack.header.format_version == 7
+            assert stack.shape == (17, 110, 120)
+            assert stack.dtype == numpy.dtype('int16')
+
+            footer = stack.footer
+            assert footer.size == 1528
+            assert footer.labels == [
+                'ExpControl X',
+                'ExpControl Y',
+                'ExpControl Z',
+                'None',
+            ]
+            assert footer.metadata_length == 0
+            assert footer.num_flush_points == 6
+            assert len(footer.flush_positions) == 6
+            assert footer.flush_positions == sorted(footer.flush_positions)
+            assert footer.flush_positions[0] > 0
+            assert footer.flush_positions[-1] < stack.header.data_length
+            assert footer.flush_block_size == 74800
+            assert list(footer.tag_dictionary) == ['imspector']
+            assert footer.tag_dictionary['imspector']
+            assert stack.asarray().sum(dtype=numpy.int64) == total
+
+
+@pytest.mark.parametrize('memmap', [False, True])
+def test_msr_mixed_dimensions(memmap):
+    """Test MSR stacks with different spatial ranks and exact name lookup."""
+    filename = DATA / 'msr-reader/mesc_yoyo2_img_001.msr'
+
+    with ObfFile(filename, memmap=memmap) as obf:
+        assert len(obf.stacks) == 2
+        for index, shape, dims, total in (
+            (0, (250, 250), ('ExpControl Y', 'ExpControl X'), 153770),
+            (
+                1,
+                (50, 235, 270),
+                ('ExpControl Z', 'ExpControl Y', 'ExpControl X'),
+                30239698,
+            ),
+        ):
+            stack = obf.stacks[index]
+            assert stack is obf.stacks[f'gfp {{{index}}}']
+            assert stack.shape == shape
+            assert stack.dims == dims
+            assert stack.dtype == numpy.dtype('int16')
+            data = stack.asxarray()
+            assert data.shape == shape
+            assert data.dims == dims
+            for dim, size in zip(dims, shape, strict=True):
+                assert data.coords[dim].shape == (size,)
+            assert data.data.sum(dtype=numpy.int64) == total
+
+
+def test_msr_unnamed_stacks():
+    """Test MSR file with several stacks sharing empty name."""
+    filename = DATA / 'msr-reader/groupa_cell01.msr'
+
+    with ObfFile(filename) as obf:
+        stacks = obf.stacks
+        assert len(stacks) == 7
+        assert [stack.name for stack in stacks] == [''] * 7
+        assert [stack.shape for stack in stacks] == [
+            (490, 450),
+            (490, 450),
+            (490, 450),
+            (490, 450),
+            (18,),
+            (18,),
+            (665,),
+        ]
+        assert stacks[-1] is stacks[6]
+        assert stacks[''] is stacks[0]
+        assert stacks.find('') is stacks[0]
+        assert len(stacks.findall('')) == 7
+
+        data = stacks[2].asarray()
+        assert data.sum(dtype=numpy.int64) == 87279577
 
 
 @pytest.mark.skipif(
