@@ -38,7 +38,7 @@ from microscopy experiments.
 
 :Author: `Christoph Gohlke <https://www.cgohlke.com>`_
 :License: BSD-3-Clause
-:Version: 2026.10.19
+:Version: 2026.10.20
 :DOI: `10.5281/zenodo.18706395 <https://doi.org/10.5281/zenodo.18706395>`_
 
 Quickstart
@@ -69,6 +69,10 @@ This revision was tested with the following requirements and dependencies
 
 Revisions
 ---------
+
+2026.10.20
+
+- Preserve stacks with duplicate names (#1).
 
 2026.10.19
 
@@ -158,7 +162,7 @@ View the image stack and metadata in an OBF file from the console::
 
 from __future__ import annotations
 
-__version__ = '2026.10.19'
+__version__ = '2026.10.20'
 
 __all__ = [
     'FILE_EXTENSIONS',
@@ -1056,11 +1060,11 @@ class ObfStackSequence(Sequence[ObfStack]):
     __slots__ = ('_parent', '_stacks')
 
     _parent: ObfFile
-    _stacks: dict[str, ObfStack]
+    _stacks: list[ObfStack]
 
     def __init__(self, parent: ObfFile, /) -> None:
         self._parent = parent
-        self._stacks = {}
+        self._stacks = []
 
         visited: set[int] = set()
         next_pos = parent.header.first_stack_pos
@@ -1070,7 +1074,8 @@ class ObfStackSequence(Sequence[ObfStack]):
             visited.add(next_pos)
             parent._fh.seek(next_pos)
             stack = ObfStack(parent)
-            self._stacks[stack.name] = stack
+            # stack names are not unique; for example, they may be empty
+            self._stacks.append(stack)
             next_pos = stack.header.next_stack_pos
 
     def find(
@@ -1093,7 +1098,7 @@ class ObfStackSequence(Sequence[ObfStack]):
 
         """
         pattern = re.compile(key, flags=flags)
-        for stack in self._stacks.values():
+        for stack in self._stacks:
             value = stack.name
             if pattern.search(value) is not None:
                 return stack
@@ -1117,7 +1122,7 @@ class ObfStackSequence(Sequence[ObfStack]):
         """
         pattern = re.compile(key, flags=flags)
         images = []
-        for stack in self._stacks.values():
+        for stack in self._stacks:
             value = stack.name
             if pattern.search(value) is not None:
                 images.append(stack)
@@ -1139,15 +1144,15 @@ class ObfStackSequence(Sequence[ObfStack]):
         if isinstance(key, int):
             index = key
             try:
-                key = tuple(self._stacks.keys())[index]
+                return self._stacks[index]
             except IndexError:
                 msg = f'stack {index=} out of range'
                 raise IndexError(msg) from None
-            return self._stacks[key]
-        if key in self._stacks:
-            return self._stacks[key]
+        for stack in self._stacks:
+            if stack.name == key:
+                return stack
         pattern = re.compile(key, flags=re.IGNORECASE)
-        for stack in self._stacks.values():
+        for stack in self._stacks:
             if pattern.search(stack.name) is not None:
                 return stack
         msg = f'stack {key!r} not found'
@@ -1159,13 +1164,13 @@ class ObfStackSequence(Sequence[ObfStack]):
 
     @override
     def __iter__(self) -> Iterator[ObfStack]:
-        return iter(self._stacks.values())
+        return iter(self._stacks)
 
     def __repr__(self) -> str:
         return f'<{self.__class__.__name__} len={len(self._stacks)}>'
 
     def __str__(self) -> str:
-        return indent(repr(self)[1:-1], *(self._stacks.values()))
+        return indent(repr(self)[1:-1], *self._stacks)
 
 
 @dataclass(slots=True, frozen=True)
@@ -1724,6 +1729,7 @@ def main(argv: list[str] | None = None) -> int:
 
     imshow: Any
     try:
+        from matplotlib import pyplot
         from tifffile import imshow
     except ImportError:
         imshow = None
@@ -1764,7 +1770,8 @@ def main(argv: list[str] | None = None) -> int:
                 print()
                 if imshow is None:
                     continue
-                for i, stack in enumerate(obf.stacks):
+                plotted = False
+                for stack in obf.stacks:
                     im: Any
                     try:
                         if xarray is not None:
@@ -1785,12 +1792,15 @@ def main(argv: list[str] | None = None) -> int:
                         imshow(
                             data,
                             title=repr(stack),
-                            show=i == len(obf.stacks) - 1,
+                            show=False,
                             photometric=pm,
                             interpolation='None',
                         )
+                        plotted = True
                     except Exception as exc:
                         print(fname, exc)
+                if plotted:
+                    pyplot.show()
         except Exception:
             import traceback
 
